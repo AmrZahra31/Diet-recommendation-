@@ -157,3 +157,8 @@ You should see:
 - Add more meals or extra snacks.  
 - Support more dietary restrictions (e.g., **low-sodium**, **vegan**).  
 - Save user history to provide daily evolving recommendations.
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
