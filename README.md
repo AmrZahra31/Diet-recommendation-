@@ -5,7 +5,7 @@ It provides healthy meal suggestions based on daily caloric needs, dietary goals
 
 ---
 
-## ⚡ Features
+## Features
 
 - **One recipe per meal**: Breakfast, Snack, Lunch, Dinner.  
 - Recommendations **vary randomly** from the top 5 best-matching recipes to ensure variety.  
@@ -16,7 +16,7 @@ It provides healthy meal suggestions based on daily caloric needs, dietary goals
 
 ---
 
-## 🛠 Requirements
+## Requirements
 
 - Python >= 3.10
 - Python packages:
@@ -30,7 +30,7 @@ It provides healthy meal suggestions based on daily caloric needs, dietary goals
 
 ---
 
-## 📁 Key Files
+## Key Files
 
 - `main.py` : Main FastAPI application.  
 - `recipes_with_prices21.csv.gz` : Recipe database with nutrition and pricing info.  
@@ -40,7 +40,7 @@ It provides healthy meal suggestions based on daily caloric needs, dietary goals
 
 ---
 
-## 🚀 How to Run
+## How to Run?
 
 1. Make sure all files exist: `CSV`, `Scaler`, `Model`.  
 2. Install required packages:
@@ -62,9 +62,9 @@ You should see:
 
 ---
 
-## 📦 API Endpoints
+## API Endpoints
 
-### 1️⃣ POST `/personalized_recommend`
+### 1. POST `/personalized_recommend`
 
 **Description:** Returns a personalized daily meal plan based on user input.
 
@@ -134,7 +134,7 @@ You should see:
 
 ---
 
-### 2️⃣ GET `/`
+### 2. GET `/`
 
 **Description:** Simple health check endpoint.  
 **Response:**
@@ -144,7 +144,7 @@ You should see:
 
 ---
 
-## 🎯 Notes
+## Notes
 
 - Each meal selects **one recipe randomly** from the top 15 best-matching recipes to ensure **variety**.  
 - If no suitable meal is found that meets calories or budget, `"No meal found"` is returned.  
@@ -152,7 +152,7 @@ You should see:
 
 ---
 
-## 🔧 Extending the System
+## Extending the System
 
 - Add more meals or extra snacks.  
 - Support more dietary restrictions (e.g., **low-sodium**, **vegan**).  
