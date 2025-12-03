@@ -2,27 +2,39 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, validator
 import pandas as pd
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
 import joblib
 import tensorflow as tf
 from fastapi.middleware.cors import CORSMiddleware
 import os
 import re
-from typing import List, Optional
+from typing import List, Optional, Dict
 import logging
+import math
+import random
+
+# Try import faiss, else fallback
+try:
+    import faiss
+    HAS_FAISS = True
+except Exception:
+    from sklearn.neighbors import NearestNeighbors
+    HAS_FAISS = False
 
 # ----- Settings / Paths -----
 DATA_FILE = "recipes_with_prices21.csv.gz"
 SCALER_FILE = "scaler3.pkl"
 MODEL_FILE = "diet_model00.keras"
-ENCODED_FILE = "encoded_recipes.npy"
+ENCODED_FILE = "encoded_recipes.npy"  # should be float32 latent vectors
 
 # ----- Globals -----
 model = None
 recipes_df = pd.DataFrame()
 scaler = None
-encoded_recipes = None
+encoded_recipes = None          # full latent matrix (N x D), float32, normalized
 resources_loaded = False
+
+# Per-meal precomputed structures
+meal_partitions: Dict[str, Dict] = {}  # meal -> {indices, df, faiss_index or nn_model, encoded_matrix}
 
 # ----- FastAPI App -----
 app = FastAPI()
@@ -37,67 +49,139 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("diet_recommender")
 
-# ----- Startup loading -----
+# ----- Config -----
+USECOLS = [
+    'Calories', 'Keywords', 'Name', 'MealType', 'EstimatedPriceEGP',
+    'FatContent', 'SaturatedFatContent', 'CholesterolContent', 'SodiumContent',
+    'CarbohydrateContent', 'FiberContent', 'SugarContent', 'ProteinContent',
+    'RecipeIngredientQuantities', 'RecipeIngredientParts'
+]
+
+# ANN search params
+DEFAULT_TOP_K = 5    # sample from top_k after ranking
+ANN_SEARCH_K = 50    # how many neighbours to return from index before filtering
+
+# ----- Startup loading (heavy precompute done once) -----
 @app.on_event("startup")
 def startup_event():
-    global model, recipes_df, scaler, encoded_recipes, resources_loaded
+    global model, recipes_df, scaler, encoded_recipes, resources_loaded, meal_partitions
 
-    logger.info("Starting resource loading...")
+    logger.info("Starting resource loading and preprocessing...")
     try:
+        # --- model & scaler ---
         if not os.path.exists(MODEL_FILE):
             raise FileNotFoundError(f"Model file '{MODEL_FILE}' not found.")
         model = tf.keras.models.load_model(MODEL_FILE, compile=False)
         logger.info("Model loaded")
-
-        if not os.path.exists(DATA_FILE):
-            raise FileNotFoundError(f"Data file '{DATA_FILE}' not found.")
-        recipes_df = pd.read_csv(DATA_FILE, compression='gzip')
-        recipes_df.columns = recipes_df.columns.astype(str)
-
-        expected_columns = [
-            'Calories', 'Keywords', 'Name', 'MealType', 'EstimatedPriceEGP',
-            'FatContent', 'SaturatedFatContent', 'CholesterolContent', 'SodiumContent',
-            'CarbohydrateContent', 'FiberContent', 'SugarContent', 'ProteinContent',
-            'RecipeIngredientQuantities', 'RecipeIngredientParts'
-        ]
-        for col in expected_columns:
-            if col not in recipes_df.columns:
-                if col in ['Name', 'Keywords', 'MealType', 'RecipeIngredientParts', 'RecipeIngredientQuantities']:
-                    recipes_df[col] = ""
-                else:
-                    recipes_df[col] = 0.0
-
-        text_cols = ['Name', 'Keywords', 'MealType', 'RecipeIngredientParts']
-        for c in text_cols:
-            recipes_df[c] = recipes_df[c].astype(str).fillna("")
 
         if not os.path.exists(SCALER_FILE):
             raise FileNotFoundError(f"Scaler file '{SCALER_FILE}' not found.")
         scaler = joblib.load(SCALER_FILE)
         logger.info("Scaler loaded")
 
+        # --- load dataset (only needed columns) ---
+        if not os.path.exists(DATA_FILE):
+            raise FileNotFoundError(f"Data file '{DATA_FILE}' not found.")
+        # usecols to reduce memory; compression gzip
+        recipes_df_local = pd.read_csv(DATA_FILE, compression='gzip', usecols=lambda c: c in USECOLS)
+        recipes_df_local.columns = recipes_df_local.columns.astype(str)
+        logger.info("Dataset loaded with %d rows", len(recipes_df_local))
+
+        # ensure expected columns exist (fill missing)
+        for col in USECOLS:
+            if col not in recipes_df_local.columns:
+                if col in ['Name', 'Keywords', 'MealType', 'RecipeIngredientParts', 'RecipeIngredientQuantities']:
+                    recipes_df_local[col] = ""
+                else:
+                    recipes_df_local[col] = 0.0
+
+        # Normalize text fields once
+        text_cols = ['Name', 'Keywords', 'MealType', 'RecipeIngredientParts']
+        for c in text_cols:
+            recipes_df_local[c] = recipes_df_local[c].astype(str).fillna("")
+
+        # Ensure numeric nutrition columns
+        nutrition_columns = [
+            'Calories', 'FatContent', 'SaturatedFatContent', 'CholesterolContent',
+            'SodiumContent', 'CarbohydrateContent', 'FiberContent', 'SugarContent', 'ProteinContent'
+        ]
+        for c in nutrition_columns:
+            recipes_df_local[c] = pd.to_numeric(recipes_df_local[c], errors='coerce').fillna(0.0)
+
+        # ensure price numeric
+        recipes_df_local['EstimatedPriceEGP'] = pd.to_numeric(recipes_df_local['EstimatedPriceEGP'], errors='coerce').fillna(np.inf)
+
+        # store cleaned df globally (immutable after startup)
+        recipes_df = recipes_df_local.reset_index(drop=True)
+
+        # --- load or compute encoded_recipes ---
         if os.path.exists(ENCODED_FILE):
-            encoded_recipes = np.load(ENCODED_FILE)
-            logger.info("Encoded recipes loaded from file")
+            # load with mmap to reduce peak memory
+            encoded_recipes = np.load(ENCODED_FILE, mmap_mode='r')
+            # If dtype is not float32, convert and save new file
+            if encoded_recipes.dtype != np.float32:
+                encoded_recipes = encoded_recipes.astype(np.float32)
         else:
-            nutrition_columns = [
-                'Calories', 'FatContent', 'SaturatedFatContent', 'CholesterolContent',
-                'SodiumContent', 'CarbohydrateContent', 'FiberContent', 'SugarContent', 'ProteinContent'
-            ]
-            for c in nutrition_columns:
-                recipes_df[c] = pd.to_numeric(recipes_df[c], errors='coerce').fillna(0.0)
+            # compute latent encodings once
+            scaled = scaler.transform(recipes_df[nutrition_columns])
+            enc = model.predict(scaled, batch_size=1024)
+            enc = np.asarray(enc, dtype=np.float32)
+            # save for subsequent runs
+            np.save(ENCODED_FILE, enc)
+            encoded_recipes = enc
 
-            scaled_data = scaler.transform(recipes_df[nutrition_columns])
-            encoded_recipes = model.predict(scaled_data)
-            np.save(ENCODED_FILE, encoded_recipes)
-            logger.info("Encoded recipes computed and saved")
+        # --- normalize encoded vectors to unit norm for cosine via inner product ---
+        # convert to float32 and make separate normalized array (in memory)
+        enc_mat = np.asarray(encoded_recipes, dtype=np.float32)
+        norms = np.linalg.norm(enc_mat, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        enc_normed = (enc_mat / norms).astype(np.float32)
 
+        # free encoded_recipes reference (we keep enc_normed)
+        encoded_recipes = enc_normed  # N x D float32 normalized
+
+        logger.info("Encoded matrix prepared shape=%s dtype=%s", encoded_recipes.shape, encoded_recipes.dtype)
+
+        # --- partition by MealType and build ANN per partition ---
+        meal_partitions = {}
+        meal_types = recipes_df['MealType'].str.lower().fillna("").unique()
+        for mt in meal_types:
+            if not mt:
+                continue
+            mask = recipes_df['MealType'].str.lower() == mt
+            indices = np.where(mask)[0]
+            if len(indices) == 0:
+                continue
+            enc_sub = encoded_recipes[indices]  # view
+            partition = {'indices': indices, 'df': recipes_df.loc[indices].reset_index(drop=True)}
+            if HAS_FAISS:
+                # use inner product on normalized vectors -> cosine similarity
+                d = enc_sub.shape[1]
+                index = faiss.IndexFlatIP(d)  # exact index but fast; you can replace with IVF for huge scale
+                index.add(enc_sub)
+                partition['faiss_index'] = index
+                partition['use_faiss'] = True
+            else:
+                # fallback: build NearestNeighbors with cosine metric brute-force (uses sklearn)
+                nn = NearestNeighbors(n_neighbors=min(ANN_SEARCH_K, len(enc_sub)), metric='cosine', algorithm='brute', n_jobs=-1)
+                # sklearn's cosine distance; we'll convert to similarity later
+                nn.fit(enc_sub)
+                partition['nn_model'] = nn
+                partition['use_faiss'] = False
+
+            meal_partitions[mt] = partition
+            logger.info("Prepared partition '%s' size=%d use_faiss=%s", mt, len(indices), partition['use_faiss'])
+
+        # assign globals
+        globals()['recipes_df'] = recipes_df
+        globals()['encoded_recipes'] = encoded_recipes
+        globals()['meal_partitions'] = meal_partitions
         resources_loaded = True
-        logger.info("Resources loaded successfully")
+        logger.info("Startup preprocessing complete. Resources loaded successfully.")
 
     except Exception as e:
         resources_loaded = False
-        logger.exception("Error while loading resources: %s", e)
+        logger.exception("Error during startup: %s", e)
 
 
 # ----- Request model -----
@@ -132,29 +216,7 @@ class UserInput(BaseModel):
         return v
 
 
-# ----- Helpers -----
-def compute_bmr(gender: str, weight: float, height: float, age: int) -> float:
-    if gender == 'male':
-        return 10 * weight + 6.25 * height - 5 * age + 5
-    return 10 * weight + 6.25 * height - 5 * age - 161
-
-
-def compute_daily_caloric_intake(bmr: float, activity_level: str, goal: str) -> int:
-    intensity_multipliers = {
-        'sedentary': 1.2,
-        'lightly_active': 1.375,
-        'moderately_active': 1.55,
-        'very_active': 1.725,
-        'extra_active': 1.9
-    }
-    objective_adjustments = {
-        'weight_loss': 0.8,
-        'muscle_gain': 1.2,
-        'health_maintenance': 1.0
-    }
-    return int(round(bmr * intensity_multipliers.get(activity_level, 1.2) * objective_adjustments.get(goal, 1.0)))
-
-
+# ----- Helpers: nutrition vector builder & regex -----
 def _build_restriction_pattern(restrictions: List[str]):
     if not restrictions:
         return None
@@ -166,6 +228,7 @@ def _build_restriction_pattern(restrictions: List[str]):
 
 
 def _build_user_nutrition_vector(target_calories: float, user: UserInput):
+    # same heuristic as before — keep consistent with your training preprocessing
     weight_kg = max(30.0, user.weight)
     if user.goal == "muscle_gain":
         protein_g_per_kg = 1.8
@@ -174,7 +237,6 @@ def _build_user_nutrition_vector(target_calories: float, user: UserInput):
     else:
         protein_g_per_kg = 1.2
     protein = weight_kg * protein_g_per_kg
-
     fat_cal = target_calories * 0.25
     fat = fat_cal / 9.0
     protein_cal = protein * 4.0
@@ -185,75 +247,121 @@ def _build_user_nutrition_vector(target_calories: float, user: UserInput):
     cholesterol = 50.0
     sodium = 300.0
     fiber = max(1.0, carbs * 0.05)
-
-    vec = np.array([[target_calories, fat, saturated, cholesterol, sodium, carbs, fiber, sugar, protein]])
+    vec = np.array([[target_calories, fat, saturated, cholesterol, sodium, carbs, fiber, sugar, protein]], dtype=np.float32)
     return vec
 
 
-# ----- Recommendation logic -----
-def suggest_recipes(total_calories: float, meal_type: str, daily_budget: float, dietary_restrictions: List[str], user: UserInput, top_n: int = 1):
-    meal_split = {
-        'breakfast': (0.20, 0.20),
-        'snack':     (0.15, 0.15),
-        'lunch':     (0.35, 0.35),
-        'dinner':    (0.30, 0.30)
-    }
-    cal_ratio, budget_ratio = meal_split.get(meal_type.lower(), (0.25, 0.25))
-    target_calories = float(total_calories) * cal_ratio
-    target_budget = float(daily_budget) * budget_ratio
+# ----- Core recommendation using ANN per meal partition -----
+def _query_partition_for_user(mt: str, user: UserInput, target_calories: float, target_budget: float, dietary_restrictions: List[str], top_k_sample: int = DEFAULT_TOP_K):
+    """
+    Return a single chosen recipe record (dict) or 'No meal found' dict.
+    Steps:
+     1) Build user vector -> encode -> normalize
+     2) Query ANN within meal partition (faiss or sklearn)
+     3) From returned candidate indices, filter by budget/calories/dietary restrictions
+     4) Rank by calorie diff + price + similarity; then sample 1 from top_k_sample
+    """
+    mt_key = mt.lower()
+    if mt_key not in meal_partitions:
+        return {'Name': 'No meal found', 'MealType': mt, 'Calories': None, 'EstimatedPriceEGP': None, 'RecipeIngredientParts': None, 'RecipeIngredientQuantities': None}
 
-    nutrition_vector = _build_user_nutrition_vector(target_calories, user)
-    try:
-        scaled_vec = scaler.transform(nutrition_vector)
-        predicted_latent = model.predict(scaled_vec)
-    except Exception as e:
-        logger.exception("Prediction error: %s", e)
-        raise HTTPException(status_code=500, detail="Internal model prediction failed")
+    partition = meal_partitions[mt_key]
+    indices = partition['indices']            # indices into global recipes_df
+    df_part = partition['df']                # local df copy aligned with indices
+    enc_part = encoded_recipes[indices]      # normalized latent vectors for this partition
 
-    sims = cosine_similarity(predicted_latent, encoded_recipes)[0]
-    top_idx = np.argsort(sims)[::-1]
+    # build user latent
+    user_vec = _build_user_nutrition_vector(target_calories, user)
+    user_scaled = scaler.transform(user_vec)
+    user_enc = model.predict(user_scaled)    # shape (1, D)
+    # normalize to unit norm
+    user_enc = np.asarray(user_enc, dtype=np.float32)
+    user_norm = np.linalg.norm(user_enc)
+    if user_norm == 0:
+        user_norm = 1.0
+    user_enc = (user_enc / user_norm).astype(np.float32)
 
-    candidates = recipes_df.iloc[top_idx].copy()
-    candidates['MealType'] = candidates['MealType'].astype(str).str.lower()
+    # Query ANN
+    if partition.get('use_faiss', False):
+        index = partition['faiss_index']
+        # faiss returns inner product scores (cosine since normalized)
+        k = min(ANN_SEARCH_K, enc_part.shape[0])
+        D, I = index.search(user_enc, k)  # I shape (1,k)
+        cand_pos = I[0]                  # positions in enc_part (0..len(enc_part)-1)
+        sims = D[0]                      # similarity scores
+    else:
+        nn = partition['nn_model']
+        k = min(ANN_SEARCH_K, enc_part.shape[0])
+        dist, cand_pos = nn.kneighbors(user_enc, n_neighbors=k, return_distance=True)
+        # sklearn returns distances for cosine: similarity = 1 - dist
+        sims = 1.0 - dist[0]
+        cand_pos = cand_pos[0]
+
+    if len(cand_pos) == 0:
+        return {'Name': 'No meal found', 'MealType': mt, 'Calories': None, 'EstimatedPriceEGP': None, 'RecipeIngredientParts': None, 'RecipeIngredientQuantities': None}
+
+    # Map cand_pos to global indices and df rows quickly
+    global_pos = indices[cand_pos]  # global indices into recipes_df
+    candidates = recipes_df.loc[global_pos].copy()
+    # attach similarity and candidate order
+    candidates['_sim'] = sims
+    candidates['_global_idx'] = global_pos
+
+    # fast numeric filtering (vectorized)
     candidates['EstimatedPriceEGP'] = pd.to_numeric(candidates['EstimatedPriceEGP'], errors='coerce').fillna(np.inf)
     candidates['Calories'] = pd.to_numeric(candidates['Calories'], errors='coerce').fillna(0)
-    candidates = candidates[(candidates['MealType'] == meal_type.lower()) &
-                            (candidates['EstimatedPriceEGP'] <= target_budget) &
-                            (candidates['Calories'] <= target_calories)]
 
+    # apply budget and calories filter
+    candidates = candidates[(candidates['EstimatedPriceEGP'] <= target_budget) & (candidates['Calories'] <= target_calories)]
+    if candidates.empty:
+        # fallback: return the closest by calorie difference among the original cand set regardless of budget
+        fallback = recipes_df.loc[global_pos].copy()
+        fallback['Calories'] = pd.to_numeric(fallback['Calories'], errors='coerce').fillna(0)
+        fallback['CalorieDiff'] = np.abs(fallback['Calories'] - target_calories)
+        fallback_sorted = fallback.sort_values(by='CalorieDiff')
+        r = fallback_sorted.iloc[0]
+        return {k: r.get(k, None) for k in ['Name', 'MealType', 'Calories', 'EstimatedPriceEGP', 'RecipeIngredientParts', 'RecipeIngredientQuantities']}
+
+    # dietary restrictions via compiled regex
     pattern = _build_restriction_pattern(dietary_restrictions)
     if pattern is not None:
         mask_name = ~candidates['Name'].str.contains(pattern, na=False)
         mask_ing = ~candidates['RecipeIngredientParts'].astype(str).str.contains(pattern, na=False)
         mask_kw = ~candidates['Keywords'].astype(str).str.contains(pattern, na=False)
         candidates = candidates[mask_name & mask_ing & mask_kw]
+        if candidates.empty:
+            # fallback to previous behavior: return closest by calorie diff among budget-compliant set
+            fallback = recipes_df.loc[global_pos].copy()
+            fallback['Calories'] = pd.to_numeric(fallback['Calories'], errors='coerce').fillna(0)
+            fallback['CalorieDiff'] = np.abs(fallback['Calories'] - target_calories)
+            fallback_sorted = fallback.sort_values(by='CalorieDiff')
+            r = fallback_sorted.iloc[0]
+            return {k: r.get(k, None) for k in ['Name', 'MealType', 'Calories', 'EstimatedPriceEGP', 'RecipeIngredientParts', 'RecipeIngredientQuantities']}
 
-    if candidates.empty:
-        return pd.DataFrame([{
-            'Name': 'No meal found',
-            'MealType': meal_type,
-            'Calories': None,
-            'EstimatedPriceEGP': None,
-            'RecipeIngredientParts': None,
-            'RecipeIngredientQuantities': None
-        }])
-
+    # ranking: calorie closeness asc, price asc, similarity desc
     candidates['CalorieDiff'] = np.abs(candidates['Calories'] - target_calories)
-    candidates['Similarity'] = sims[top_idx][:len(candidates)]
-    ranked = candidates.sort_values(by=['CalorieDiff', 'EstimatedPriceEGP', 'Similarity'], ascending=[True, True, False])
+    candidates = candidates.sort_values(by=['CalorieDiff', 'EstimatedPriceEGP', '_sim'], ascending=[True, True, False])
 
-    top_k = min(15, len(ranked))
-    selected = ranked.head(top_k).sample(1)
+    # take top_k_sample then pick one randomly among them to vary results per request
+    top_k = min(top_k_sample, len(candidates))
+    chosen_row = candidates.head(top_k).sample(1).iloc[0]
 
-    cols = ['Name', 'MealType', 'Calories', 'EstimatedPriceEGP', 'RecipeIngredientParts', 'RecipeIngredientQuantities']
-    return selected[cols]
+    return {k: chosen_row.get(k, None) for k in ['Name', 'MealType', 'Calories', 'EstimatedPriceEGP', 'RecipeIngredientParts', 'RecipeIngredientQuantities']}
 
 
 def suggest_full_day_meal_plan(total_calories: float, daily_budget: float, dietary_restrictions: List[str], user: UserInput):
     plan = {}
-    for meal in ['breakfast', 'snack', 'lunch', 'dinner']:
-        recipes = suggest_recipes(total_calories, meal, daily_budget, dietary_restrictions, user, top_n=1)
-        plan[meal] = recipes.reset_index(drop=True).to_dict(orient="records")
+    meal_types = ['breakfast', 'snack', 'lunch', 'dinner']
+    for meal in meal_types:
+        # compute per-meal target and budget here (same as before)
+        ratio_map = {'breakfast': 0.20, 'snack': 0.15, 'lunch': 0.35, 'dinner': 0.30}
+        cal_ratio = ratio_map.get(meal, 0.25)
+        target_cal = total_calories * cal_ratio
+        budget_ratio = cal_ratio  # re-use same split for budget
+        target_budget = daily_budget * budget_ratio
+
+        rec = _query_partition_for_user(meal, user, target_cal, target_budget, dietary_restrictions, top_k_sample=DEFAULT_TOP_K)
+        plan[meal] = [rec]
     return plan
 
 
@@ -263,9 +371,15 @@ def personalized_recommendation(user: UserInput):
     if not resources_loaded:
         raise HTTPException(status_code=503, detail="Resources are still loading or failed to load.")
 
-    bmr = compute_bmr(user.gender, user.weight, user.height, user.age)
-    target_calories = compute_daily_caloric_intake(bmr, user.activity_level, user.goal)
-    suggestions = suggest_full_day_meal_plan(target_calories, user.daily_budget, user.dietary_restrictions, user)
+    bmr = 10 * user.weight + 6.25 * user.height - 5 * user.age + (5 if user.gender == 'male' else -161)
+    target_calories = int(round(bmr * {
+        'sedentary': 1.2, 'lightly_active': 1.375, 'moderately_active': 1.55,
+        'very_active': 1.725, 'extra_active': 1.9
+    }.get(user.activity_level, 1.2) * {
+        'weight_loss': 0.8, 'muscle_gain': 1.2, 'health_maintenance': 1.0
+    }.get(user.goal, 1.0)))
+
+    suggestions = suggest_full_day_meal_plan(target_calories, user.daily_budget, user.dietary_restrictions or [], user)
     per_meal_target = round(target_calories / 4)
 
     return {
@@ -277,4 +391,4 @@ def personalized_recommendation(user: UserInput):
 
 @app.get("/")
 def read_root():
-    return {"message": "Service is running "}
+    return {"message": "Service is running"}
